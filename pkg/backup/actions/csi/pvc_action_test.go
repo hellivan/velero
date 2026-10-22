@@ -1851,7 +1851,7 @@ func TestPatchVGSCDeletionPolicy(t *testing.T) {
 				crClient: crClient,
 			}
 
-			err := action.patchVGSCDeletionPolicy(t.Context(), vgs)
+			err := action.patchVGSCDeletionPolicy(t.Context(), vgs, true)
 			if tt.expectErr {
 				require.Error(t, err)
 				return

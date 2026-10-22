@@ -24,12 +24,14 @@ import (
 	"github.com/sirupsen/logrus"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	kubeerrs "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/client-go/util/retry"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	velerov1 "github.com/velero-io/velero/pkg/apis/velero/v1"
 	"github.com/velero-io/velero/pkg/label"
+	"github.com/velero-io/velero/pkg/util/boolptr"
 	kubeutil "github.com/velero-io/velero/pkg/util/kube"
 )
 
@@ -53,10 +55,36 @@ func CleanupBackupVolumeGroupSnapshots(ctx context.Context, backup *velerov1.Bac
 	if err != nil && !errors.Is(err, ErrVGSAPINotAvailable) {
 		cleanupErrs = append(cleanupErrs, errors.Wrap(err, "listing backup VolumeGroupSnapshotContents"))
 	}
+	// Group members cannot be deleted from the backend one by one (the CSI
+	// sidecar skips them), so a backend group snapshot is only removed by deleting
+	// its VolumeGroupSnapshotContent while its policy is Delete. Local snapshot
+	// backups keep the backend snapshots as the backup itself. Data movement
+	// backups have already uploaded their data, so they release them.
+	keepBackendSnapshots := !boolptr.IsSetToTrue(backup.Spec.SnapshotMoveData)
+	groupUIDs := map[types.UID]struct{}{}
+	if groups != nil {
+		for i := range groups.Items {
+			groupUIDs[groups.Items[i].UID] = struct{}{}
+		}
+	}
 	processedContents := map[string]struct{}{}
 	if err == nil {
 		for i := range contents.Items {
 			content := &contents.Items[i]
+			if !keepBackendSnapshots {
+				// Deleting the VolumeGroupSnapshot below deletes its content, and the
+				// driver then removes the backend snapshots. Only delete contents whose
+				// group is already gone (e.g. a previous cleanup attempt).
+				if _, groupExists := groupUIDs[content.Spec.VolumeGroupSnapshotRef.UID]; groupExists {
+					continue
+				}
+				if err := DeleteVGSC(ctx, client, content.Name); err != nil && !apierrors.IsNotFound(err) {
+					cleanupErrs = append(cleanupErrs, errors.Wrapf(err, "deleting VolumeGroupSnapshotContent %s", content.Name))
+				} else {
+					processedContents[content.Name] = struct{}{}
+				}
+				continue
+			}
 			if err := retainAndDeleteVGSC(ctx, client, content.Name, nil, false); err != nil {
 				cleanupErrs = append(cleanupErrs, err)
 			} else {
@@ -136,7 +164,13 @@ func CleanupBackupVolumeGroupSnapshots(ctx context.Context, backup *velerov1.Bac
 						ref := content.Spec.VolumeGroupSnapshotRef
 						if ref.UID != group.UID || ref.Name != group.Name || ref.Namespace != group.Namespace {
 							cleanupErrs = append(cleanupErrs, errors.Errorf("VolumeGroupSnapshotContent %s is not bound to %s/%s", content.Name, group.Namespace, group.Name))
-						} else if err := retainAndDeleteVGSC(ctx, client, contentName, backup, true); err != nil {
+						} else if keepBackendSnapshots {
+							if err := retainAndDeleteVGSC(ctx, client, contentName, backup, true); err != nil {
+								cleanupErrs = append(cleanupErrs, err)
+								groupsPending = true
+								continue
+							}
+						} else if err := labelVGSC(ctx, client, contentName, backup); err != nil {
 							cleanupErrs = append(cleanupErrs, err)
 							groupsPending = true
 							continue
@@ -173,6 +207,27 @@ func CleanupBackupVolumeGroupSnapshots(ctx context.Context, backup *velerov1.Bac
 		}
 	}
 	return kubeerrs.NewAggregate(cleanupErrs)
+}
+
+// labelVGSC marks a VolumeGroupSnapshotContent as belonging to the backup
+// without changing its deletion policy.
+func labelVGSC(ctx context.Context, client crclient.Client, contentName string, backup *velerov1.Backup) error {
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		content, err := GetVGSC(ctx, client, contentName)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+			return err
+		}
+		kubeutil.AddLabels(&content.ObjectMeta, map[string]string{
+			velerov1.BackupNameLabel: label.GetValidName(backup.Name),
+			velerov1.BackupUIDLabel:  string(backup.UID),
+		})
+		_, err = UpdateVGSC(ctx, client, content)
+		return err
+	})
+	return errors.Wrapf(err, "labeling VolumeGroupSnapshotContent %s", contentName)
 }
 
 func retainAndDeleteVGSC(ctx context.Context, client crclient.Client, contentName string, backup *velerov1.Backup, labelContent bool) error {

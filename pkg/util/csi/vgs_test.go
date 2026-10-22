@@ -440,3 +440,48 @@ func TestVGSHelpersAPINotAvailable(t *testing.T) {
 	_, err := csi.ListVGSClasses(t.Context(), c)
 	require.ErrorIs(t, err, csi.ErrVGSAPINotAvailable)
 }
+
+func TestCleanupBackupVolumeGroupSnapshotsBackendRetention(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		moveData    bool
+		vgscDeleted bool
+		vgscPolicy  snapshotv1.DeletionPolicy
+	}{
+		{name: "local snapshot backup retains the backend group snapshot", moveData: false, vgscDeleted: true},
+		{name: "data movement backup leaves the policy so the driver deletes the backend group snapshot", moveData: true, vgscPolicy: snapshotv1.VolumeSnapshotContentDelete},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			moveData := tt.moveData
+			backup := &velerov1.Backup{
+				ObjectMeta: metav1.ObjectMeta{Name: "backup", Namespace: "velero", UID: "backup-uid"},
+				Spec:       velerov1.BackupSpec{SnapshotMoveData: &moveData},
+			}
+			contentName := "group-content"
+			group := &volumegroupsnapshotv1.VolumeGroupSnapshot{
+				ObjectMeta: metav1.ObjectMeta{Name: "group", Namespace: "app", UID: "group-uid", Labels: map[string]string{velerov1.BackupUIDLabel: "backup-uid"}},
+				Status:     &volumegroupsnapshotv1.VolumeGroupSnapshotStatus{BoundVolumeGroupSnapshotContentName: &contentName},
+			}
+			content := &volumegroupsnapshotv1.VolumeGroupSnapshotContent{
+				ObjectMeta: metav1.ObjectMeta{Name: contentName, Labels: map[string]string{velerov1.BackupUIDLabel: "backup-uid"}},
+				Spec: volumegroupsnapshotv1.VolumeGroupSnapshotContentSpec{
+					DeletionPolicy:         snapshotv1.VolumeSnapshotContentDelete,
+					VolumeGroupSnapshotRef: corev1api.ObjectReference{Name: "group", Namespace: "app", UID: "group-uid"},
+				},
+			}
+			client := velerotest.NewFakeControllerRuntimeClientWithVGS(t, backup, group, content)
+			require.NoError(t, csi.CleanupBackupVolumeGroupSnapshots(t.Context(), backup, client, logrus.New()))
+
+			_, err := csi.GetVGS(t.Context(), client, "app", "group")
+			require.True(t, apierrors.IsNotFound(err))
+			got, err := csi.GetVGSC(t.Context(), client, contentName)
+			if tt.vgscDeleted {
+				require.True(t, apierrors.IsNotFound(err))
+				return
+			}
+			// The fake client doesn't cascade the VGS deletion to its content.
+			require.NoError(t, err)
+			require.Equal(t, tt.vgscPolicy, got.Spec.DeletionPolicy)
+		})
+	}
+}

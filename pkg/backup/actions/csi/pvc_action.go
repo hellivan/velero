@@ -816,8 +816,10 @@ func (p *pvcBackupItemAction) getVolumeSnapshotReference(
 			return nil, errors.Wrapf(err, "failed to re-fetch VolumeGroupSnapshot %s after VGSC binding wait", newVGS.Name)
 		}
 
-		// Patch the VGSC deletionPolicy to Retain.
-		err = p.patchVGSCDeletionPolicy(ctx, latestVGS)
+		// Retain the backend group snapshot for local snapshot backups. A data
+		// movement backup uploads the data and must let the CSI driver delete the
+		// group snapshot together with the VGS, otherwise it is orphaned.
+		err = p.patchVGSCDeletionPolicy(ctx, latestVGS, !boolptr.IsSetToTrue(backup.Spec.SnapshotMoveData))
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to patch VolumeGroupSnapshotContent Deletion Policy for VolumeGroupSnapshot %s", newVGS.Name)
 		}
@@ -1166,7 +1168,7 @@ func (p *pvcBackupItemAction) updateVGSCreatedVS(
 	return nil
 }
 
-func (p *pvcBackupItemAction) patchVGSCDeletionPolicy(ctx context.Context, vgs *volumegroupsnapshotv1.VolumeGroupSnapshot) error {
+func (p *pvcBackupItemAction) patchVGSCDeletionPolicy(ctx context.Context, vgs *volumegroupsnapshotv1.VolumeGroupSnapshot, retain bool) error {
 	if vgs == nil || vgs.Status == nil || vgs.Status.BoundVolumeGroupSnapshotContentName == nil {
 		return errors.New("VolumeGroupSnapshotContent name not found in VGS status")
 	}
@@ -1179,7 +1181,7 @@ func (p *pvcBackupItemAction) patchVGSCDeletionPolicy(ctx context.Context, vgs *
 			return errors.Wrapf(err, "failed to get VolumeGroupSnapshotContent %s for VolumeGroupSnapshot %s/%s", *vgscName, vgs.Namespace, vgs.Name)
 		}
 
-		if vgsc.Spec.DeletionPolicy == snapshotv1api.VolumeSnapshotContentDelete {
+		if retain && vgsc.Spec.DeletionPolicy == snapshotv1api.VolumeSnapshotContentDelete {
 			p.log.Infof("Patching VGSC %s to Retain deletionPolicy", *vgscName)
 			vgsc.Spec.DeletionPolicy = snapshotv1api.VolumeSnapshotContentRetain
 		} else {
