@@ -721,6 +721,56 @@ func TestDeleteVolumeSnapshotIfAny(t *testing.T) {
 	}
 }
 
+func TestDeleteVolumeSnapshotIfAnyVGSMember(t *testing.T) {
+	groupName := "fake-vgs"
+	newVS := func() *snapshotv1api.VolumeSnapshot {
+		return &snapshotv1api.VolumeSnapshot{
+			ObjectMeta: metav1.ObjectMeta{Name: "fake-vs", Namespace: "fake-ns"},
+			Status:     &snapshotv1api.VolumeSnapshotStatus{VolumeGroupSnapshotName: &groupName},
+		}
+	}
+
+	tests := []struct {
+		name        string
+		deleteFunc  func(*snapshotFake.Clientset, *string)
+		expectExist bool
+		logMessage  string
+	}{
+		{
+			name: "VGS member deletion is deferred",
+			deleteFunc: func(c *snapshotFake.Clientset, logMessage *string) {
+				DeleteVolumeSnapshotIfAny(t.Context(), c.SnapshotV1(), "fake-vs", "fake-ns", velerotest.NewSingleLogger(logMessage))
+			},
+			expectExist: true,
+			logMessage:  "Deferring deletion of VGS member VolumeSnapshot fake-ns/fake-vs",
+		},
+		{
+			name: "copied VGS member is deleted",
+			deleteFunc: func(c *snapshotFake.Clientset, logMessage *string) {
+				DeleteCopiedVolumeSnapshotIfAny(t.Context(), c.SnapshotV1(), "fake-vs", "fake-ns", velerotest.NewSingleLogger(logMessage))
+			},
+			expectExist: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fakeSnapshotClient := snapshotFake.NewSimpleClientset(newVS())
+			logMessage := ""
+
+			test.deleteFunc(fakeSnapshotClient, &logMessage)
+
+			_, err := fakeSnapshotClient.SnapshotV1().VolumeSnapshots("fake-ns").Get(t.Context(), "fake-vs", metav1.GetOptions{})
+			if test.expectExist {
+				require.NoError(t, err)
+				assert.Contains(t, logMessage, test.logMessage)
+			} else {
+				require.True(t, apierrors.IsNotFound(err))
+			}
+		})
+	}
+}
+
 func TestRetainVSC(t *testing.T) {
 	vscObj := &snapshotv1api.VolumeSnapshotContent{
 		ObjectMeta: metav1.ObjectMeta{
