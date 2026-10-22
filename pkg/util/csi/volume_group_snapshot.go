@@ -23,6 +23,7 @@ import (
 	snapshotv1 "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
 	"github.com/sirupsen/logrus"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kubeerrs "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/client-go/util/retry"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
@@ -82,13 +83,21 @@ func CleanupBackupVolumeGroupSnapshots(ctx context.Context, backup *velerov1.Bac
 	if err := client.List(ctx, memberContents, crclient.MatchingLabels(map[string]string{velerov1.BackupUIDLabel: string(backup.UID)})); err != nil {
 		cleanupErrs = append(cleanupErrs, errors.Wrap(err, "listing backup VolumeSnapshotContents"))
 	}
+	// Member VolumeSnapshots are gone once their VGS is deleted, so a retry
+	// can only recognise members through the content's group handle.
+	isMember := func(content *snapshotv1.VolumeSnapshotContent) bool {
+		if _, ok := memberContentNames[content.Name]; ok {
+			return true
+		}
+		return content.Status != nil && content.Status.VolumeGroupSnapshotHandle != nil
+	}
 	// VGS members skip individual finalization while the parent exists. Retain
 	// their backend snapshots before VGS deletion even if a driver omitted the
 	// member VolumeGroupSnapshotHandle status field.
 	memberRetentionFailed := false
 	for i := range memberContents.Items {
 		content := &memberContents.Items[i]
-		if _, isMember := memberContentNames[content.Name]; !isMember {
+		if !isMember(content) {
 			continue
 		}
 		if content.Spec.DeletionPolicy == snapshotv1.VolumeSnapshotContentRetain {
@@ -107,6 +116,7 @@ func CleanupBackupVolumeGroupSnapshots(ctx context.Context, backup *velerov1.Bac
 		}
 	}
 
+	groupsPending := memberRetentionFailed
 	if groups != nil {
 		for i := range groups.Items {
 			group := &groups.Items[i]
@@ -119,6 +129,7 @@ func CleanupBackupVolumeGroupSnapshots(ctx context.Context, backup *velerov1.Bac
 					content, err := GetVGSC(ctx, client, contentName)
 					if err != nil && !apierrors.IsNotFound(err) {
 						cleanupErrs = append(cleanupErrs, errors.Wrapf(err, "getting content of VolumeGroupSnapshot %s/%s", group.Namespace, group.Name))
+						groupsPending = true
 						continue
 					}
 					if err == nil {
@@ -127,6 +138,7 @@ func CleanupBackupVolumeGroupSnapshots(ctx context.Context, backup *velerov1.Bac
 							cleanupErrs = append(cleanupErrs, errors.Errorf("VolumeGroupSnapshotContent %s is not bound to %s/%s", content.Name, group.Namespace, group.Name))
 						} else if err := retainAndDeleteVGSC(ctx, client, contentName, backup, true); err != nil {
 							cleanupErrs = append(cleanupErrs, err)
+							groupsPending = true
 							continue
 						}
 					}
@@ -139,6 +151,24 @@ func CleanupBackupVolumeGroupSnapshots(ctx context.Context, backup *velerov1.Bac
 			log.Infof("Cleaning up VolumeGroupSnapshot %s/%s after backup finalization", group.Namespace, group.Name)
 			if err := DeleteVGS(ctx, client, group.Namespace, group.Name); err != nil && !apierrors.IsNotFound(err) {
 				cleanupErrs = append(cleanupErrs, errors.Wrapf(err, "deleting VolumeGroupSnapshot %s/%s", group.Namespace, group.Name))
+				groupsPending = true
+			}
+		}
+	}
+
+	// Deleting the VGS cascades to the member VolumeSnapshots only. Nothing else
+	// removes their VolumeSnapshotContents, and the snapshot-controller never
+	// deletes a content whose VolumeSnapshot is gone. The contents are Retain, so
+	// deleting them only drops the API objects. The members are found by the
+	// backup label and the group handle, which also works once the VGS is gone.
+	if !groupsPending {
+		for i := range memberContents.Items {
+			content := &memberContents.Items[i]
+			if !isMember(content) {
+				continue
+			}
+			if err := client.Delete(ctx, &snapshotv1.VolumeSnapshotContent{ObjectMeta: metav1.ObjectMeta{Name: content.Name}}); err != nil && !apierrors.IsNotFound(err) {
+				cleanupErrs = append(cleanupErrs, errors.Wrapf(err, "deleting VolumeSnapshotContent %s", content.Name))
 			}
 		}
 	}

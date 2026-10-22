@@ -26,6 +26,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 	corev1api "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -40,6 +41,7 @@ type failingVGSClient struct {
 	updateErr       error
 	updateErrByName map[string]error
 	deleteErr       error
+	deleteErrByName map[string]error
 }
 
 func (c *failingVGSClient) List(ctx context.Context, list crclient.ObjectList, opts ...crclient.ListOption) error {
@@ -60,8 +62,28 @@ func (c *failingVGSClient) Update(ctx context.Context, obj crclient.Object, opts
 }
 
 func (c *failingVGSClient) Delete(ctx context.Context, obj crclient.Object, opts ...crclient.DeleteOption) error {
+	if err, found := c.deleteErrByName[obj.GetName()]; found {
+		return err
+	}
 	if c.deleteErr != nil {
 		return c.deleteErr
+	}
+	return c.Client.Delete(ctx, obj, opts...)
+}
+
+// policyRecordingClient records the deletion policy a VolumeSnapshotContent has
+// at the moment it is deleted.
+type policyRecordingClient struct {
+	crclient.Client
+	policyAtDelete map[string]snapshotv1.DeletionPolicy
+}
+
+func (c *policyRecordingClient) Delete(ctx context.Context, obj crclient.Object, opts ...crclient.DeleteOption) error {
+	if _, ok := obj.(*snapshotv1.VolumeSnapshotContent); ok {
+		current := &snapshotv1.VolumeSnapshotContent{}
+		if err := c.Client.Get(ctx, crclient.ObjectKeyFromObject(obj), current); err == nil {
+			c.policyAtDelete[current.Name] = current.Spec.DeletionPolicy
+		}
 	}
 	return c.Client.Delete(ctx, obj, opts...)
 }
@@ -213,11 +235,106 @@ func TestCleanupBackupVolumeGroupSnapshots(t *testing.T) {
 	_, err = csi.GetVGSC(t.Context(), client, processedContent.Name)
 	require.Error(t, err)
 	updatedMemberContent := &snapshotv1.VolumeSnapshotContent{}
-	require.NoError(t, client.Get(t.Context(), crclient.ObjectKeyFromObject(memberContent), updatedMemberContent))
-	require.Equal(t, snapshotv1.VolumeSnapshotContentRetain, updatedMemberContent.Spec.DeletionPolicy)
+	err = client.Get(t.Context(), crclient.ObjectKeyFromObject(memberContent), updatedMemberContent)
+	require.True(t, apierrors.IsNotFound(err))
 	updatedOrdinaryContent := &snapshotv1.VolumeSnapshotContent{}
 	require.NoError(t, client.Get(t.Context(), crclient.ObjectKeyFromObject(ordinaryContent), updatedOrdinaryContent))
 	require.Equal(t, snapshotv1.VolumeSnapshotContentDelete, updatedOrdinaryContent.Spec.DeletionPolicy)
+}
+
+func TestCleanupBackupVolumeGroupSnapshotsMemberContents(t *testing.T) {
+	newBackup := func(moveData bool) *velerov1.Backup {
+		return &velerov1.Backup{
+			ObjectMeta: metav1.ObjectMeta{Name: "backup", Namespace: "velero", UID: "backup-uid"},
+			Spec:       velerov1.BackupSpec{SnapshotMoveData: &moveData},
+		}
+	}
+	backupLabels := map[string]string{velerov1.BackupUIDLabel: "backup-uid"}
+	newGroup := func() *volumegroupsnapshotv1.VolumeGroupSnapshot {
+		return &volumegroupsnapshotv1.VolumeGroupSnapshot{
+			ObjectMeta: metav1.ObjectMeta{Name: "group", Namespace: "app", UID: "group-uid", Labels: backupLabels},
+		}
+	}
+	newMember := func(policy snapshotv1.DeletionPolicy) (*snapshotv1.VolumeSnapshotContent, *snapshotv1.VolumeSnapshot) {
+		content := &snapshotv1.VolumeSnapshotContent{
+			ObjectMeta: metav1.ObjectMeta{Name: "member-content", Labels: backupLabels},
+			Spec:       snapshotv1.VolumeSnapshotContentSpec{DeletionPolicy: policy},
+		}
+		groupName := "group"
+		vs := &snapshotv1.VolumeSnapshot{
+			ObjectMeta: metav1.ObjectMeta{Name: "member-vs", Namespace: "app", Labels: backupLabels},
+			Status: &snapshotv1.VolumeSnapshotStatus{
+				VolumeGroupSnapshotName:        &groupName,
+				BoundVolumeSnapshotContentName: &content.Name,
+			},
+		}
+		return content, vs
+	}
+
+	for _, tt := range []struct {
+		name           string
+		moveData       bool
+		contentPolicy  snapshotv1.DeletionPolicy
+		expectedPolicy snapshotv1.DeletionPolicy
+	}{
+		{name: "local snapshot backup only drops the API object", moveData: false, contentPolicy: snapshotv1.VolumeSnapshotContentDelete, expectedPolicy: snapshotv1.VolumeSnapshotContentRetain},
+		{name: "data movement backup only drops the API object", moveData: true, contentPolicy: snapshotv1.VolumeSnapshotContentRetain, expectedPolicy: snapshotv1.VolumeSnapshotContentRetain},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			backup := newBackup(tt.moveData)
+			content, vs := newMember(tt.contentPolicy)
+			client := &policyRecordingClient{
+				Client:         velerotest.NewFakeControllerRuntimeClientWithVGS(t, backup, newGroup(), content, vs),
+				policyAtDelete: map[string]snapshotv1.DeletionPolicy{},
+			}
+			require.NoError(t, csi.CleanupBackupVolumeGroupSnapshots(t.Context(), backup, client, logrus.New()))
+			require.Equal(t, tt.expectedPolicy, client.policyAtDelete[content.Name])
+			err := client.Get(t.Context(), crclient.ObjectKeyFromObject(content), &snapshotv1.VolumeSnapshotContent{})
+			require.True(t, apierrors.IsNotFound(err))
+		})
+	}
+
+	t.Run("retry after the VGS is gone still finds members by group handle", func(t *testing.T) {
+		backup := newBackup(false)
+		handle := "group-handle"
+		member := &snapshotv1.VolumeSnapshotContent{
+			ObjectMeta: metav1.ObjectMeta{Name: "member-content", Labels: backupLabels},
+			Spec:       snapshotv1.VolumeSnapshotContentSpec{DeletionPolicy: snapshotv1.VolumeSnapshotContentRetain},
+			Status:     &snapshotv1.VolumeSnapshotContentStatus{VolumeGroupSnapshotHandle: &handle},
+		}
+		ordinary := &snapshotv1.VolumeSnapshotContent{
+			ObjectMeta: metav1.ObjectMeta{Name: "ordinary-content", Labels: backupLabels},
+			Spec:       snapshotv1.VolumeSnapshotContentSpec{DeletionPolicy: snapshotv1.VolumeSnapshotContentRetain},
+		}
+		client := velerotest.NewFakeControllerRuntimeClientWithVGS(t, backup, member, ordinary)
+		require.NoError(t, csi.CleanupBackupVolumeGroupSnapshots(t.Context(), backup, client, logrus.New()))
+		err := client.Get(t.Context(), crclient.ObjectKeyFromObject(member), &snapshotv1.VolumeSnapshotContent{})
+		require.True(t, apierrors.IsNotFound(err))
+		require.NoError(t, client.Get(t.Context(), crclient.ObjectKeyFromObject(ordinary), &snapshotv1.VolumeSnapshotContent{}))
+	})
+
+	t.Run("keeps members while a VGS could not be deleted", func(t *testing.T) {
+		backup := newBackup(true)
+		content, vs := newMember(snapshotv1.VolumeSnapshotContentDelete)
+		client := &failingVGSClient{
+			Client:          velerotest.NewFakeControllerRuntimeClientWithVGS(t, backup, newGroup(), content, vs),
+			deleteErrByName: map[string]error{"group": errors.New("delete failed")},
+		}
+		require.ErrorContains(t, csi.CleanupBackupVolumeGroupSnapshots(t.Context(), backup, client, logrus.New()), "deleting VolumeGroupSnapshot")
+		current := &snapshotv1.VolumeSnapshotContent{}
+		require.NoError(t, client.Get(t.Context(), crclient.ObjectKeyFromObject(content), current))
+		require.Equal(t, snapshotv1.VolumeSnapshotContentRetain, current.Spec.DeletionPolicy)
+	})
+
+	t.Run("reports a member content deletion failure", func(t *testing.T) {
+		backup := newBackup(false)
+		content, vs := newMember(snapshotv1.VolumeSnapshotContentRetain)
+		client := &failingVGSClient{
+			Client:          velerotest.NewFakeControllerRuntimeClientWithVGS(t, backup, newGroup(), content, vs),
+			deleteErrByName: map[string]error{content.Name: errors.New("delete failed")},
+		}
+		require.ErrorContains(t, csi.CleanupBackupVolumeGroupSnapshots(t.Context(), backup, client, logrus.New()), "deleting VolumeSnapshotContent")
+	})
 }
 
 func TestCleanupBackupVolumeGroupSnapshotsErrors(t *testing.T) {

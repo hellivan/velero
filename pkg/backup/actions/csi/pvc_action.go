@@ -1114,6 +1114,7 @@ func (p *pvcBackupItemAction) updateVGSCreatedVS(
 			continue
 		}
 
+		var boundContent string
 		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 			// Re-fetch the latest VS to avoid conflict
 			latestVS := &snapshotv1api.VolumeSnapshot{}
@@ -1128,11 +1129,37 @@ func (p *pvcBackupItemAction) updateVGSCreatedVS(
 			latestVS.Labels[velerov1api.BackupNameLabel] = backup.Name
 			latestVS.Labels[velerov1api.BackupUIDLabel] = string(backup.UID)
 
+			boundContent = ""
+			if latestVS.Status != nil && latestVS.Status.BoundVolumeSnapshotContentName != nil {
+				boundContent = *latestVS.Status.BoundVolumeSnapshotContentName
+			}
+
 			// Attempt to update
 			return p.crClient.Update(ctx, latestVS)
 		})
 		if err != nil {
 			return errors.Wrapf(err, "failed to update VS %s (PVC %s) after retrying on conflict", vs.Name, pvcName)
+		}
+
+		// Label the member content so that the VGS cleanup can find and remove it.
+		// Data movement backups skip the VolumeSnapshot backup action that labels
+		// contents in local mode.
+		if boundContent != "" {
+			err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				vsc := &snapshotv1api.VolumeSnapshotContent{}
+				if err := p.crClient.Get(ctx, crclient.ObjectKey{Name: boundContent}, vsc); err != nil {
+					return err
+				}
+				if vsc.Labels == nil {
+					vsc.Labels = make(map[string]string)
+				}
+				vsc.Labels[velerov1api.BackupNameLabel] = label.GetValidName(backup.Name)
+				vsc.Labels[velerov1api.BackupUIDLabel] = string(backup.UID)
+				return p.crClient.Update(ctx, vsc)
+			})
+			if err != nil {
+				return errors.Wrapf(err, "failed to label VolumeSnapshotContent %s (PVC %s)", boundContent, pvcName)
+			}
 		}
 	}
 
