@@ -102,7 +102,9 @@ The VGS backup workflow is triggered by a simple label on your PVCs.
     *   Waits for the CSI driver to create the individual `VolumeSnapshot` objects.
     *   Applies the backup's labels to each `VolumeSnapshot` for tracking.
 
-4.  **Resource Cleanup:** Velero keeps the temporary `VolumeGroupSnapshot` and `VolumeGroupSnapshotContent` resources while the Backup processes and finalizes the individual `VolumeSnapshots`. After the Backup reaches a terminal phase and its archive is persisted, Velero retains the backend snapshot data, deletes the VGS/VGSC API resources, and completes cleanup.
+4.  **Resource Cleanup:** Velero keeps the temporary `VolumeGroupSnapshot` and `VolumeGroupSnapshotContent` resources while the Backup processes and finalizes the individual `VolumeSnapshots`. After the Backup reaches a terminal phase and its archive is persisted, Velero deletes the VGS/VGSC API resources and the member `VolumeSnapshotContent` objects, and completes cleanup. What happens to the backend snapshots depends on the backup type:
+    *   **Local snapshot backups:** Velero sets the deletion policy of the `VolumeGroupSnapshotContent` and the member `VolumeSnapshotContent` objects to `Retain`, so the backend snapshots are kept as the backup.
+    *   **Snapshot data movement backups:** the data has already been uploaded, so Velero keeps the deletion policy of the `VolumeGroupSnapshotContent`, and deleting the `VolumeGroupSnapshot` makes the CSI driver delete the backend group snapshot. This requires the `VolumeGroupSnapshotClass` to use `deletionPolicy: Delete`; with `Retain` the backend group snapshot is kept.
 
     While the parent VGS exists, external-snapshotter may keep VGS member `VolumeSnapshot` objects in `Terminating` while its protection finalizers are processed. This is expected; terminal VGS cleanup releases the member snapshots after Backup finalization.
 

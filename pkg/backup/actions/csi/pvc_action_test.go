@@ -1809,6 +1809,7 @@ func TestPatchVGSCDeletionPolicy(t *testing.T) {
 	tests := []struct {
 		name           string
 		initialPolicy  snapshotv1api.DeletionPolicy
+		retain         bool
 		expectedPolicy snapshotv1api.DeletionPolicy
 		expectPatch    bool
 		expectErr      bool
@@ -1816,14 +1817,22 @@ func TestPatchVGSCDeletionPolicy(t *testing.T) {
 		{
 			name:           "patches Delete to Retain",
 			initialPolicy:  snapshotv1api.VolumeSnapshotContentDelete,
+			retain:         true,
 			expectedPolicy: snapshotv1api.VolumeSnapshotContentRetain,
 			expectPatch:    true,
 		},
 		{
 			name:           "no patch if already Retain",
 			initialPolicy:  snapshotv1api.VolumeSnapshotContentRetain,
+			retain:         true,
 			expectedPolicy: snapshotv1api.VolumeSnapshotContentRetain,
 			expectPatch:    false,
+		},
+		{
+			name:           "keeps Delete when retention is not requested",
+			initialPolicy:  snapshotv1api.VolumeSnapshotContentDelete,
+			retain:         false,
+			expectedPolicy: snapshotv1api.VolumeSnapshotContentDelete,
 		},
 	}
 
@@ -1851,7 +1860,7 @@ func TestPatchVGSCDeletionPolicy(t *testing.T) {
 				crClient: crClient,
 			}
 
-			err := action.patchVGSCDeletionPolicy(t.Context(), vgs, true)
+			err := action.patchVGSCDeletionPolicy(t.Context(), vgs, tt.retain)
 			if tt.expectErr {
 				require.Error(t, err)
 				return

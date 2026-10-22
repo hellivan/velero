@@ -20,11 +20,11 @@ import (
 	"context"
 
 	"github.com/cockroachdb/errors"
+	volumegroupsnapshotv1 "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumegroupsnapshot/v1"
 	snapshotv1 "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
 	"github.com/sirupsen/logrus"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	kubeerrs "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/client-go/util/retry"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
@@ -58,33 +58,24 @@ func CleanupBackupVolumeGroupSnapshots(ctx context.Context, backup *velerov1.Bac
 		cleanupErrs = append(cleanupErrs, errors.Wrap(err, "listing backup VolumeGroupSnapshotContents"))
 	}
 	// Group members cannot be deleted from the backend one by one (the CSI
-	// sidecar skips them), so a backend group snapshot is only removed by deleting
-	// its VolumeGroupSnapshotContent while its policy is Delete. Local snapshot
-	// backups keep the backend snapshots as the backup itself. Data movement
-	// backups have already uploaded their data, so they release them.
+	// sidecar skips them), so a backend group snapshot is only removed when its
+	// VolumeGroupSnapshotContent is deleted while its policy is Delete, which the
+	// snapshot controller does when the VolumeGroupSnapshot is deleted. Local
+	// snapshot backups keep the backend snapshots as the backup itself. Data
+	// movement backups have already uploaded their data, so they release them.
 	keepBackendSnapshots := !boolptr.IsSetToTrue(backup.Spec.SnapshotMoveData)
-	groupUIDs := map[types.UID]struct{}{}
-	if groups != nil {
-		for i := range groups.Items {
-			groupUIDs[groups.Items[i].UID] = struct{}{}
-		}
+	releasesBackend := func(content *volumegroupsnapshotv1.VolumeGroupSnapshotContent) bool {
+		return !keepBackendSnapshots && content.Spec.DeletionPolicy == snapshotv1.VolumeSnapshotContentDelete
 	}
 	processedContents := map[string]struct{}{}
 	if err == nil {
 		for i := range contents.Items {
 			content := &contents.Items[i]
-			if !keepBackendSnapshots {
-				// Deleting the VolumeGroupSnapshot below deletes its content, and the
-				// driver then removes the backend snapshots. Only delete contents whose
-				// group is already gone (e.g. a previous cleanup attempt).
-				if _, groupExists := groupUIDs[content.Spec.VolumeGroupSnapshotRef.UID]; groupExists {
-					continue
-				}
-				if err := DeleteVGSC(ctx, client, content.Name); err != nil && !apierrors.IsNotFound(err) {
-					cleanupErrs = append(cleanupErrs, errors.Wrapf(err, "deleting VolumeGroupSnapshotContent %s", content.Name))
-				} else {
-					processedContents[content.Name] = struct{}{}
-				}
+			// Leave the content to the VolumeGroupSnapshot deletion below. Deleting
+			// it directly would not make the sidecar call the driver, because the
+			// snapshot controller sets the being-deleted annotation it requires only
+			// when it processes the VolumeGroupSnapshot deletion.
+			if releasesBackend(content) {
 				continue
 			}
 			if err := retainAndDeleteVGSC(ctx, client, content.Name, nil, false); err != nil {
@@ -167,13 +158,13 @@ func CleanupBackupVolumeGroupSnapshots(ctx context.Context, backup *velerov1.Bac
 						ref := content.Spec.VolumeGroupSnapshotRef
 						if ref.UID != group.UID || ref.Name != group.Name || ref.Namespace != group.Namespace {
 							cleanupErrs = append(cleanupErrs, errors.Errorf("VolumeGroupSnapshotContent %s is not bound to %s/%s", content.Name, group.Namespace, group.Name))
-						} else if keepBackendSnapshots {
-							if err := retainAndDeleteVGSC(ctx, client, contentName, backup, true); err != nil {
+						} else if releasesBackend(content) {
+							if err := labelVGSC(ctx, client, contentName, backup); err != nil {
 								cleanupErrs = append(cleanupErrs, err)
 								groupsPending = true
 								continue
 							}
-						} else if err := labelVGSC(ctx, client, contentName, backup); err != nil {
+						} else if err := retainAndDeleteVGSC(ctx, client, contentName, backup, true); err != nil {
 							cleanupErrs = append(cleanupErrs, err)
 							groupsPending = true
 							continue
@@ -223,10 +214,15 @@ func labelVGSC(ctx context.Context, client crclient.Client, contentName string, 
 			}
 			return err
 		}
-		kubeutil.AddLabels(&content.ObjectMeta, map[string]string{
+		labels := map[string]string{
 			velerov1.BackupNameLabel: label.GetValidName(backup.Name),
 			velerov1.BackupUIDLabel:  string(backup.UID),
-		})
+		}
+		if content.Labels[velerov1.BackupNameLabel] == labels[velerov1.BackupNameLabel] &&
+			content.Labels[velerov1.BackupUIDLabel] == labels[velerov1.BackupUIDLabel] {
+			return nil
+		}
+		kubeutil.AddLabels(&content.ObjectMeta, labels)
 		_, err = UpdateVGSC(ctx, client, content)
 		return err
 	})

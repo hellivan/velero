@@ -504,3 +504,53 @@ func TestCleanupBackupVolumeGroupSnapshotsBackendRetention(t *testing.T) {
 		})
 	}
 }
+
+func TestCleanupBackupVolumeGroupSnapshotsReleasesBackendOnlyThroughVGS(t *testing.T) {
+	moveData := true
+	backup := &velerov1.Backup{
+		ObjectMeta: metav1.ObjectMeta{Name: "backup", Namespace: "velero", UID: "backup-uid"},
+		Spec:       velerov1.BackupSpec{SnapshotMoveData: &moveData},
+	}
+	newContent := func(policy snapshotv1.DeletionPolicy, labelled bool) *volumegroupsnapshotv1.VolumeGroupSnapshotContent {
+		content := &volumegroupsnapshotv1.VolumeGroupSnapshotContent{
+			ObjectMeta: metav1.ObjectMeta{Name: "group-content"},
+			Spec: volumegroupsnapshotv1.VolumeGroupSnapshotContentSpec{
+				DeletionPolicy:         policy,
+				VolumeGroupSnapshotRef: corev1api.ObjectReference{Name: "group", Namespace: "app", UID: "group-uid"},
+			},
+		}
+		if labelled {
+			content.Labels = map[string]string{velerov1.BackupUIDLabel: "backup-uid"}
+		}
+		return content
+	}
+
+	t.Run("a Delete content is never deleted directly", func(t *testing.T) {
+		// Without the VGS deletion the sidecar would never call the driver for it.
+		client := velerotest.NewFakeControllerRuntimeClientWithVGS(t, backup, newContent(snapshotv1.VolumeSnapshotContentDelete, true))
+		require.NoError(t, csi.CleanupBackupVolumeGroupSnapshots(t.Context(), backup, client, logrus.New()))
+		_, err := csi.GetVGSC(t.Context(), client, "group-content")
+		require.NoError(t, err)
+	})
+
+	t.Run("a Retain content only drops the API object", func(t *testing.T) {
+		client := velerotest.NewFakeControllerRuntimeClientWithVGS(t, backup, newContent(snapshotv1.VolumeSnapshotContentRetain, true))
+		require.NoError(t, csi.CleanupBackupVolumeGroupSnapshots(t.Context(), backup, client, logrus.New()))
+		_, err := csi.GetVGSC(t.Context(), client, "group-content")
+		require.True(t, apierrors.IsNotFound(err))
+	})
+
+	t.Run("an unlabelled bound Delete content is labelled for later cleanup", func(t *testing.T) {
+		contentName := "group-content"
+		group := &volumegroupsnapshotv1.VolumeGroupSnapshot{
+			ObjectMeta: metav1.ObjectMeta{Name: "group", Namespace: "app", UID: "group-uid", Labels: map[string]string{velerov1.BackupUIDLabel: "backup-uid"}},
+			Status:     &volumegroupsnapshotv1.VolumeGroupSnapshotStatus{BoundVolumeGroupSnapshotContentName: &contentName},
+		}
+		client := velerotest.NewFakeControllerRuntimeClientWithVGS(t, backup, group, newContent(snapshotv1.VolumeSnapshotContentDelete, false))
+		require.NoError(t, csi.CleanupBackupVolumeGroupSnapshots(t.Context(), backup, client, logrus.New()))
+		got, err := csi.GetVGSC(t.Context(), client, contentName)
+		require.NoError(t, err)
+		require.Equal(t, snapshotv1.VolumeSnapshotContentDelete, got.Spec.DeletionPolicy)
+		require.Equal(t, "backup-uid", got.Labels[velerov1.BackupUIDLabel])
+	})
+}

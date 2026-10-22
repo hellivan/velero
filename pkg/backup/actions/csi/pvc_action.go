@@ -1181,10 +1181,13 @@ func (p *pvcBackupItemAction) patchVGSCDeletionPolicy(ctx context.Context, vgs *
 			return errors.Wrapf(err, "failed to get VolumeGroupSnapshotContent %s for VolumeGroupSnapshot %s/%s", *vgscName, vgs.Namespace, vgs.Name)
 		}
 
-		if retain && vgsc.Spec.DeletionPolicy == snapshotv1api.VolumeSnapshotContentDelete {
+		switch {
+		case !retain:
+			p.log.Infof("Keeping deletionPolicy=%s of VGSC %s", vgsc.Spec.DeletionPolicy, *vgscName)
+		case vgsc.Spec.DeletionPolicy == snapshotv1api.VolumeSnapshotContentDelete:
 			p.log.Infof("Patching VGSC %s to Retain deletionPolicy", *vgscName)
 			vgsc.Spec.DeletionPolicy = snapshotv1api.VolumeSnapshotContentRetain
-		} else {
+		default:
 			p.log.Infof("VGSC %s already set to deletionPolicy=%s", *vgscName, vgsc.Spec.DeletionPolicy)
 		}
 		if vgsc.Labels == nil {
