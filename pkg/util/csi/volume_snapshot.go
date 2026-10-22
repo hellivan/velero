@@ -296,12 +296,38 @@ func DeleteVolumeSnapshotIfAny(
 	vsNamespace string,
 	log logrus.FieldLogger,
 ) {
+	deleteVolumeSnapshotIfAny(ctx, snapshotClient, vsName, vsNamespace, false, log)
+}
+
+// DeleteCopiedVolumeSnapshotIfAny deletes a VS that Velero created as a copy of
+// another snapshot (e.g. the data mover's backup VS). Such a copy points at a
+// member of a group snapshot and is reported as a group member by the snapshot
+// controller, but no VGS exists for it in its own namespace, so no VGS cleanup
+// would ever delete it. It must therefore not be deferred.
+func DeleteCopiedVolumeSnapshotIfAny(
+	ctx context.Context,
+	snapshotClient snapshotter.SnapshotV1Interface,
+	vsName string,
+	vsNamespace string,
+	log logrus.FieldLogger,
+) {
+	deleteVolumeSnapshotIfAny(ctx, snapshotClient, vsName, vsNamespace, true, log)
+}
+
+func deleteVolumeSnapshotIfAny(
+	ctx context.Context,
+	snapshotClient snapshotter.SnapshotV1Interface,
+	vsName string,
+	vsNamespace string,
+	force bool,
+	log logrus.FieldLogger,
+) {
 	vs, err := snapshotClient.VolumeSnapshots(vsNamespace).Get(ctx, vsName, metav1.GetOptions{})
 	if err != nil && !apierrors.IsNotFound(err) {
 		log.WithError(err).Warnf("Unable to check VGS membership for VolumeSnapshot %s/%s", vsNamespace, vsName)
 		return
 	}
-	if err == nil && vs.Status != nil && vs.Status.VolumeGroupSnapshotName != nil {
+	if !force && err == nil && vs.Status != nil && vs.Status.VolumeGroupSnapshotName != nil {
 		log.Warnf("Deferring deletion of VGS member VolumeSnapshot %s/%s until VGS cleanup", vsNamespace, vsName)
 		return
 	}
