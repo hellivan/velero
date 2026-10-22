@@ -28,6 +28,7 @@ import (
 	corev1api "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	velerov1 "github.com/velero-io/velero/pkg/apis/velero/v1"
@@ -38,6 +39,7 @@ import (
 type failingVGSClient struct {
 	crclient.Client
 	listErr         error
+	listVGSErr      error
 	updateErr       error
 	updateErrByName map[string]error
 	deleteErr       error
@@ -47,6 +49,9 @@ type failingVGSClient struct {
 func (c *failingVGSClient) List(ctx context.Context, list crclient.ObjectList, opts ...crclient.ListOption) error {
 	if c.listErr != nil {
 		return c.listErr
+	}
+	if ul, ok := list.(*unstructured.UnstructuredList); ok && ul.GetKind() == "VolumeGroupSnapshotList" && c.listVGSErr != nil {
+		return c.listVGSErr
 	}
 	return c.Client.List(ctx, list, opts...)
 }
@@ -324,6 +329,20 @@ func TestCleanupBackupVolumeGroupSnapshotsMemberContents(t *testing.T) {
 		current := &snapshotv1.VolumeSnapshotContent{}
 		require.NoError(t, client.Get(t.Context(), crclient.ObjectKeyFromObject(content), current))
 		require.Equal(t, snapshotv1.VolumeSnapshotContentRetain, current.Spec.DeletionPolicy)
+	})
+
+	t.Run("keeps members while the VGS list is unknown", func(t *testing.T) {
+		backup := newBackup(false)
+		content, vs := newMember(snapshotv1.VolumeSnapshotContentRetain)
+		client := &failingVGSClient{
+			Client:     velerotest.NewFakeControllerRuntimeClientWithVGS(t, backup, newGroup(), content, vs),
+			listVGSErr: errors.New("list failed"),
+		}
+		handle := "group-handle"
+		content.Status = &snapshotv1.VolumeSnapshotContentStatus{VolumeGroupSnapshotHandle: &handle}
+		require.NoError(t, client.Update(t.Context(), content))
+		require.ErrorContains(t, csi.CleanupBackupVolumeGroupSnapshots(t.Context(), backup, client, logrus.New()), "listing backup VolumeGroupSnapshots")
+		require.NoError(t, client.Get(t.Context(), crclient.ObjectKeyFromObject(content), &snapshotv1.VolumeSnapshotContent{}))
 	})
 
 	t.Run("reports a member content deletion failure", func(t *testing.T) {

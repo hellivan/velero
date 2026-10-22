@@ -44,12 +44,14 @@ func CleanupBackupVolumeGroupSnapshots(ctx context.Context, backup *velerov1.Bac
 	}
 
 	var cleanupErrs []error
+	groupsListFailed := false
 	groups, err := ListVGS(ctx, client, "", map[string]string{velerov1.BackupUIDLabel: string(backup.UID)})
 	if err != nil {
 		if errors.Is(err, ErrVGSAPINotAvailable) {
 			return nil
 		}
 		cleanupErrs = append(cleanupErrs, errors.Wrap(err, "listing backup VolumeGroupSnapshots"))
+		groupsListFailed = true
 	}
 	contents, err := ListVGSC(ctx, client, map[string]string{velerov1.BackupUIDLabel: string(backup.UID)})
 	if err != nil && !errors.Is(err, ErrVGSAPINotAvailable) {
@@ -144,7 +146,8 @@ func CleanupBackupVolumeGroupSnapshots(ctx context.Context, backup *velerov1.Bac
 		}
 	}
 
-	groupsPending := memberRetentionFailed
+	// Unknown groups may still exist, so their members must not be deleted yet.
+	groupsPending := memberRetentionFailed || groupsListFailed
 	if groups != nil {
 		for i := range groups.Items {
 			group := &groups.Items[i]
