@@ -2539,6 +2539,52 @@ func TestCleanUp_SecretsAndConfigMaps(t *testing.T) {
 	assert.NoError(t, err, "unrelated secret should not be deleted")
 }
 
+// The data mover's copy of a group member snapshot is reported as a group member by the
+// snapshot controller, but no VolumeGroupSnapshot exists for it in the Velero namespace.
+// Deferring its deletion to the group cleanup would leave it behind for good.
+func TestCleanUp_CopiedGroupMemberVolumeSnapshot(t *testing.T) {
+	ownerObject := corev1api.ObjectReference{
+		Kind:       "Backup",
+		Namespace:  "velero",
+		Name:       "du-123",
+		UID:        "fake-uid",
+		APIVersion: "v1",
+	}
+	sourceVSName := "source-vs"
+	sourceNamespace := "app-ns"
+	groupName := ptr.To("group")
+
+	copiedVS := &snapshotv1api.VolumeSnapshot{
+		ObjectMeta: metav1.ObjectMeta{Name: ownerObject.Name, Namespace: ownerObject.Namespace},
+		Status:     &snapshotv1api.VolumeSnapshotStatus{VolumeGroupSnapshotName: groupName},
+	}
+	copiedVSC := &snapshotv1api.VolumeSnapshotContent{
+		ObjectMeta: metav1.ObjectMeta{Name: ownerObject.Name},
+	}
+	sourceVS := &snapshotv1api.VolumeSnapshot{
+		ObjectMeta: metav1.ObjectMeta{Name: sourceVSName, Namespace: sourceNamespace},
+		Status:     &snapshotv1api.VolumeSnapshotStatus{VolumeGroupSnapshotName: groupName},
+	}
+
+	fakeSnapshotClient := snapshotFake.NewSimpleClientset(copiedVS, copiedVSC, sourceVS)
+	exposer := csiSnapshotExposer{
+		kubeClient:        fake.NewSimpleClientset(),
+		csiSnapshotClient: fakeSnapshotClient.SnapshotV1(),
+		log:               velerotest.NewLogger(),
+	}
+
+	exposer.CleanUp(t.Context(), ownerObject, sourceVSName, sourceNamespace)
+
+	_, err := fakeSnapshotClient.SnapshotV1().VolumeSnapshots(ownerObject.Namespace).Get(t.Context(), copiedVS.Name, metav1.GetOptions{})
+	require.Error(t, err, "the copied VolumeSnapshot should be deleted even though it looks like a group member")
+
+	_, err = fakeSnapshotClient.SnapshotV1().VolumeSnapshotContents().Get(t.Context(), copiedVSC.Name, metav1.GetOptions{})
+	require.Error(t, err, "the copied VolumeSnapshotContent should be deleted")
+
+	_, err = fakeSnapshotClient.SnapshotV1().VolumeSnapshots(sourceNamespace).Get(t.Context(), sourceVSName, metav1.GetOptions{})
+	require.NoError(t, err, "the source group member is left to the group cleanup")
+}
+
 // TestBackupPodCBTServiceSAFlagMatchesDatamoverBackupFlags pins the contract between the
 // flag createBackupPod emits for the CSI snapshot metadata service's service account and
 // the flag NewBackupCommand actually registers to consume it. These previously drifted
