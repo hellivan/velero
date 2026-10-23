@@ -18,6 +18,7 @@ package basic
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/cockroachdb/errors"
 	. "github.com/onsi/gomega"
@@ -27,6 +28,7 @@ import (
 	. "github.com/velero-io/velero/test"
 	. "github.com/velero-io/velero/test/e2e/test"
 	"github.com/velero-io/velero/test/util/common"
+	csiutil "github.com/velero-io/velero/test/util/csi"
 	. "github.com/velero-io/velero/test/util/k8s"
 	. "github.com/velero-io/velero/test/util/providers"
 	. "github.com/velero-io/velero/test/util/velero"
@@ -111,6 +113,24 @@ func (c *CSIVolumeGroupSnapshotVolumeInfo) CreateResources() error {
 	if err := WaitForReadyDeployment(c.Client.ClientGo, namespace, deployment.Name); err != nil {
 		return errors.Wrapf(err, "failed to wait for the deployment in namespace %s", namespace)
 	}
+	return nil
+}
+
+// Backup also checks that finalizing the backup leaves no VolumeSnapshotContent
+// behind. Deleting the VolumeGroupSnapshot only removes the member VolumeSnapshots,
+// so the member contents are the part of the group that is easy to leak.
+func (c *CSIVolumeGroupSnapshotVolumeInfo) Backup() error {
+	if err := c.BackupVolumeInfo.Backup(); err != nil {
+		return err
+	}
+
+	// The group is released on a reconciliation after the backup is complete.
+	index := map[string]string{"backupNameLabel": c.BackupName, "namespace": c.CaseBaseName}
+	Eventually(func() error {
+		_, err := csiutil.CheckVolumeSnapshotCR(c.Client, index, 0)
+		return err
+	}).WithTimeout(2*time.Minute).WithPolling(5*time.Second).Should(Succeed(),
+		"VolumeSnapshotContents of the volume group were left behind after the backup")
 	return nil
 }
 
