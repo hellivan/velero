@@ -1805,6 +1805,128 @@ func TestUpdateVGSCreatedVS(t *testing.T) {
 	}
 }
 
+// vscUpdateFailingClient fails updates of VolumeSnapshotContents only.
+type vscUpdateFailingClient struct {
+	crclient.Client
+}
+
+func (c *vscUpdateFailingClient) Update(ctx context.Context, obj crclient.Object, opts ...crclient.UpdateOption) error {
+	if _, ok := obj.(*snapshotv1api.VolumeSnapshotContent); ok {
+		return errors.New("injected error on update")
+	}
+	return c.Client.Update(ctx, obj, opts...)
+}
+
+func TestUpdateVGSCreatedVSLabelsMemberContent(t *testing.T) {
+	vgs := &volumegroupsnapshotv1.VolumeGroupSnapshot{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-vgs", Namespace: "ns", UID: "vgs-uid-123"},
+	}
+	vscName := "member-vsc"
+
+	makeVS := func(boundContent *string) *snapshotv1api.VolumeSnapshot {
+		return &snapshotv1api.VolumeSnapshot{
+			ObjectMeta: metav1.ObjectMeta{Name: "member-vs", Namespace: vgs.Namespace},
+			Spec: snapshotv1api.VolumeSnapshotSpec{
+				Source: snapshotv1api.VolumeSnapshotSource{PersistentVolumeClaimName: ptr.To("pvc-1")},
+			},
+			Status: &snapshotv1api.VolumeSnapshotStatus{
+				VolumeGroupSnapshotName:        ptr.To(vgs.Name),
+				BoundVolumeSnapshotContentName: boundContent,
+			},
+		}
+	}
+	makeVSC := func() *snapshotv1api.VolumeSnapshotContent {
+		return &snapshotv1api.VolumeSnapshotContent{
+			ObjectMeta: metav1.ObjectMeta{Name: vscName, Labels: map[string]string{"existing": "label"}},
+		}
+	}
+
+	tests := []struct {
+		name       string
+		backupName string
+		vs         *snapshotv1api.VolumeSnapshot
+		withVSC    bool
+		failUpdate bool
+		expectErr  string
+		expectVSC  bool
+	}{
+		{
+			name:       "labels the bound content and keeps its other labels",
+			backupName: "backup-1",
+			vs:         makeVS(ptr.To(vscName)),
+			withVSC:    true,
+			expectVSC:  true,
+		},
+		{
+			name:       "uses the valid label name for long backup names",
+			backupName: strings.Repeat("long-backup-name-", 6),
+			vs:         makeVS(ptr.To(vscName)),
+			withVSC:    true,
+			expectVSC:  true,
+		},
+		{
+			name:       "skips a member that is not bound to a content yet",
+			backupName: "backup-1",
+			vs:         makeVS(nil),
+			withVSC:    true,
+		},
+		{
+			name:       "fails when the bound content does not exist",
+			backupName: "backup-1",
+			vs:         makeVS(ptr.To(vscName)),
+			expectErr:  "failed to label VolumeSnapshotContent " + vscName,
+		},
+		{
+			name:       "fails when the content cannot be updated",
+			backupName: "backup-1",
+			vs:         makeVS(ptr.To(vscName)),
+			withVSC:    true,
+			failUpdate: true,
+			expectErr:  "failed to label VolumeSnapshotContent " + vscName,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			backup := &velerov1api.Backup{
+				ObjectMeta: metav1.ObjectMeta{Name: tt.backupName, UID: "backup-uid-123"},
+			}
+			objs := []runtime.Object{vgs, tt.vs}
+			if tt.withVSC {
+				objs = append(objs, makeVSC())
+			}
+			var client crclient.Client = velerotest.NewFakeControllerRuntimeClient(t, objs...)
+			if tt.failUpdate {
+				// Fail only the content update, not the VolumeSnapshot one before it.
+				client = &vscUpdateFailingClient{Client: client}
+			}
+			action := &pvcBackupItemAction{log: velerotest.NewLogger(), crClient: client}
+
+			vsMap := map[string]*snapshotv1api.VolumeSnapshot{"pvc-1": tt.vs}
+			err := action.updateVGSCreatedVS(t.Context(), vsMap, vgs, backup)
+			if tt.expectErr != "" {
+				require.ErrorContains(t, err, tt.expectErr)
+				return
+			}
+			require.NoError(t, err)
+
+			if !tt.withVSC {
+				return
+			}
+			updated := &snapshotv1api.VolumeSnapshotContent{}
+			require.NoError(t, client.Get(t.Context(), crclient.ObjectKey{Name: vscName}, updated))
+			if tt.expectVSC {
+				assert.Equal(t, label.GetValidName(backup.Name), updated.Labels[velerov1api.BackupNameLabel])
+				assert.Equal(t, "backup-uid-123", updated.Labels[velerov1api.BackupUIDLabel])
+				assert.Equal(t, "label", updated.Labels["existing"])
+			} else {
+				assert.NotContains(t, updated.Labels, velerov1api.BackupNameLabel)
+				assert.NotContains(t, updated.Labels, velerov1api.BackupUIDLabel)
+			}
+		})
+	}
+}
+
 func TestPatchVGSCDeletionPolicy(t *testing.T) {
 	tests := []struct {
 		name           string
