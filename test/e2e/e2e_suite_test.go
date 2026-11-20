@@ -573,6 +573,16 @@ var _ = Describe(
 )
 var _ = Describe(
 	"",
+	Label("BackupVolumeInfo", "CSIVolumeGroupSnapshotCleanup"),
+	CSIVolumeGroupSnapshotCleanupTest,
+)
+var _ = Describe(
+	"",
+	Label("BackupVolumeInfo", "CSIVolumeGroupSnapshotDataMoverCleanup"),
+	CSIVolumeGroupSnapshotDataMoverCleanupTest,
+)
+var _ = Describe(
+	"",
 	Label("BackupVolumeInfo", "NativeSnapshot"),
 	NativeSnapshotVolumeInfoTest,
 )
